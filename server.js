@@ -1,13 +1,11 @@
 const express = require('express');
-const cors = require('cors');
-const dotenv = require('dotenv');
 const { Pool } = require('pg');
 const mqtt = require('mqtt');
 const Pusher = require("pusher");
-
-// Route files
+const cors = require('cors');
+const dotenv = require('dotenv');
 const authRoutes = require('./routes/auth');
-const emailRoutes = require('./routes/emailRoutes');
+const emailRoutes = require('./routes/emailRoutes'); // Tambahkan route email
 
 dotenv.config();
 
@@ -16,37 +14,46 @@ const port = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json()); // Built-in body parser
 
-// Pusher setup
+// Setup pusher
 const pusher = new Pusher({
-  appId: process.env.PUSHER_APP_ID || "1993310",
-  key: process.env.PUSHER_KEY || "bc484970cb551cc676b8",
-  secret: process.env.PUSHER_SECRET || "da4c3963a61ee7ccdded",
-  cluster: process.env.PUSHER_CLUSTER || "ap1",
+  appId: "1993310",
+  key: "bc484970cb551cc676b8",
+  secret: "da4c3963a61ee7ccdded",
+  cluster: "ap1",
   useTLS: true
 });
 
-// PostgreSQL setup
+// Setup koneksi PostgreSQL untuk data filter
 const pool = new Pool({
-  user: process.env.PG_USER || 'postgres',
-  host: process.env.PG_HOST || 'localhost',
-  database: process.env.PG_DB || 'data_compass',
-  password: process.env.PG_PASS || '12345',
-  port: process.env.PG_PORT || 5432,
+  user: 'postgres',
+  host: 'localhost',
+  database: 'data_compass',
+  password: '12345',
+  port: 5432,
 });
 
-// In-memory cache
+// Cache memory untuk data raw
 let rawDataCache = [];
 
-// Util: Validasi dan parsing data sensor
+// Fungsi validasi dan parsing data sensor dari data.raw JSON string
 function parseAndValidate(rawData) {
   try {
+    // Parse sensor data
     const sensor = JSON.parse(rawData.data);
+    
+    // Parse radio data (string JSON) jadi objek
     const radioObj = JSON.parse(rawData.radio);
-    const timestampMs = Math.floor(radioObj.time * 1000);
-    if (isNaN(timestampMs)) return null;
 
+    // Konversi waktu dari detik ke milidetik dan cek valid
+    const timestampMs = Math.floor(radioObj.time * 1000);
+    if (isNaN(timestampMs)) {
+      return null;
+    }
+    const timestamp = new Date(timestampMs);
+
+    // Validasi tipe data sensor
     if (
       typeof sensor.T !== 'number' ||
       typeof sensor.RH !== 'number' ||
@@ -54,7 +61,9 @@ function parseAndValidate(rawData) {
       typeof sensor.CO2 !== 'number' ||
       typeof sensor.Vol !== 'number' ||
       typeof sensor.Tm !== 'number'
-    ) return null;
+    ) {
+      return null; // invalid sensor data
+    }
 
     return {
       temperature: sensor.T,
@@ -63,45 +72,60 @@ function parseAndValidate(rawData) {
       co2: sensor.CO2,
       vol: sensor.Vol,
       tm: sensor.Tm,
-      timestamp: new Date(timestampMs)
+      timestamp: timestamp
     };
   } catch (e) {
     console.error('Parsing error:', e);
-    return null;
+    return null; // parsing error
   }
 }
 
-// MQTT setup
-const mqttClient = mqtt.connect('tcp://mqtt.telkomiot.id:1883', {
-  clientId: 'compass-subscriber-nodejs',
-  username: process.env.MQTT_USER || '196f5e3dd76a3b6f',
-  password: process.env.MQTT_PASS || '196f5e3dd78d2611'
-});
+// -----------------------------------
+// Setup MQTT subscribe
+// -----------------------------------
 
-const mqttTopic = process.env.MQTT_TOPIC || 'v2.0/subs/APP682463a4825ed63550/DEV68254873228f299787';
+const mqttBrokerUrl = 'tcp://mqtt.telkomiot.id:1883';
+const mqttOptions = {
+  clientId: 'compass-subscriber-nodejs',
+  username: '196f5e3dd76a3b6f',  // ganti sesuai Access Key
+  password: '196f5e3dd78d2611',  // ganti sesuai Access Token
+};
+
+const mqttTopic = 'v2.0/subs/APP682463a4825ed63550/DEV68254873228f299787';
+
+const mqttClient = mqtt.connect(mqttBrokerUrl, mqttOptions);
 
 mqttClient.on('connect', () => {
   console.log('Connected to MQTT broker');
   mqttClient.subscribe(mqttTopic, (err) => {
-    if (err) console.error('Subscribe error:', err);
-    else console.log(`Subscribed to topic: ${mqttTopic}`);
+    if (err) {
+      console.error('Subscribe error:', err);
+    } else {
+      console.log(`Subscribed to topic: ${mqttTopic}`);
+    }
   });
 });
 
 mqttClient.on('message', async (topic, message) => {
-  console.log(`MQTT message received: ${message.toString()}`);
-  const rawPayload = JSON.parse(message.toString());
-
-  rawDataCache.unshift(rawPayload);
-  if (rawDataCache.length > 100) rawDataCache.pop();
-
-  const filteredData = parseAndValidate(rawPayload);
-  if (!filteredData) {
-    console.warn('Invalid sensor data');
-    return;
-  }
+  console.log(`MQTT message received on topic ${topic}: ${message.toString()}`);
 
   try {
+    // Parse payload JSON dari string MQTT message
+    const rawPayload = JSON.parse(message.toString());
+
+    // Simpan ke cache
+    rawDataCache.unshift(rawPayload);
+    if (rawDataCache.length > 100) rawDataCache.pop();
+
+    // Parsing dan validasi data sensor
+    const filteredData = parseAndValidate(rawPayload);
+
+    if (!filteredData) {
+      console.warn('Invalid sensor data, skipped saving to DB');
+      return; // skip simpan DB
+    }
+
+    // Simpan ke database
     await pool.query(
       `INSERT INTO sensor_data (temperature, humidity, gm, co2, vol, tm, timestamp)
        VALUES ($1, $2, $3, $4, $5, $6, $7)`,
@@ -112,25 +136,27 @@ mqttClient.on('message', async (topic, message) => {
         filteredData.co2,
         filteredData.vol,
         filteredData.tm,
-        filteredData.timestamp
+        filteredData.timestamp,
       ]
     );
+    console.log('Filtered data saved:', filteredData);
 
-    pusher.trigger('sensor-channel', 'new-data', filteredData);
-  } catch (err) {
-    console.error('❌ Error saving to DB:', err);
+  pusher.trigger('sensor-channel', 'new-data', filteredData);
+  } catch (error) {
+    console.error('❌ Error processing MQTT message:', error);
   }
 });
 
-// Routes
-app.use('/api/auth', authRoutes);
-app.use('/api/email', emailRoutes);
+// -----------------------------------
+// Endpoint HTTP untuk MQTT
+// -----------------------------------
 
-// API untuk data sensor
+// Tampilkan data raw dari cache
 app.get('/raw', (req, res) => {
   res.json(rawDataCache);
 });
 
+// Tampilkan data filter dari DB
 app.get('/raw/filtered', async (req, res) => {
   try {
     const result = await pool.query(
@@ -139,19 +165,29 @@ app.get('/raw/filtered', async (req, res) => {
     );
     res.json(result.rows);
   } catch (error) {
-    console.error('Error fetching data:', error);
+    console.error('Error fetching filtered data:', error);
     res.status(500).send('Failed to fetch filtered data');
   }
 });
 
+// Endpoint POST /mqtt/raw tetap ada (optional) kalau kamu mau masih bisa nerima data via HTTP juga
 app.post('/mqtt/raw', async (req, res) => {
   const rawData = req.body;
+  console.log('Received raw data:', rawData);
+
+  // Simpan ke cache
   rawDataCache.unshift(rawData);
   if (rawDataCache.length > 100) rawDataCache.pop();
 
+  // Parse & filter data sensor
   const filteredData = parseAndValidate(rawData);
-  if (!filteredData) return res.status(400).send('Invalid sensor data');
 
+  if (!filteredData) {
+    console.warn('Invalid sensor data, skipped saving to DB');
+    return res.status(400).send('Invalid sensor data');
+  }
+
+  // Simpan hasil filter ke DB
   try {
     await pool.query(
       `INSERT INTO sensor_data (temperature, humidity, gm, co2, vol, tm, timestamp)
@@ -166,16 +202,27 @@ app.post('/mqtt/raw', async (req, res) => {
         filteredData.timestamp
       ]
     );
+    console.log('Filtered data saved:', filteredData);
 
-    pusher.trigger('sensor-channel', 'new-data', filteredData);
-    res.status(200).send('Data saved successfully');
+     pusher.trigger('sensor-channel', 'new-data', filteredData);
+
+    res.status(200).send('Raw data cached and filtered data saved');
   } catch (error) {
-    console.error('Error saving HTTP data:', error);
+    console.error('❌ Failed to save HTTP filtered data:', error);
     res.status(500).send('Failed to save filtered data');
   }
 });
 
-// Root
+// -----------------------------------
+// Endpoint HTTP untuk auth
+// -----------------------------------
+
+app.use('/api', emailRoutes);
+// Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/email', emailRoutes); // Gunakan prefix '/api/email' agar lebih spesifik
+
+// Root endpoint
 app.get('/', (req, res) => {
   res.send('Server berjalan dengan baik');
 });
